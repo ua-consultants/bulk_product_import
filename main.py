@@ -1,6 +1,8 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import StreamingResponse
-import pandas as pd
+from openpyxl import load_workbook
+import csv
+from datetime import datetime
 import io
 from pptx import Presentation
 from pptx.util import Inches
@@ -20,38 +22,60 @@ app = FastAPI(title="ERP Product Import/Export Service")
 # -----------------------------
 @app.post("/import/excel")
 async def import_excel(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
-        raise HTTPException(400, "Only .xlsx, .xls, .csv allowed")
-    
+    if not file.filename.endswith(('.xlsx', '.csv')):
+        raise HTTPException(400, "Only .xlsx or .csv allowed")
+
     contents = await file.read()
+    products = []
+
     try:
         if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
+            text = contents.decode("utf-8").splitlines()
+            reader = csv.DictReader(text)
+
+            for row in reader:
+                products.append({
+                    'name': row.get('Name', ''),
+                    'category_name': row.get('Category', ''),
+                    'subcategory_name': row.get('Subcategory', ''),
+                    'description': row.get('Description', ''),
+                    'price': float(row.get('Price') or 0),
+                    'stock_quantity': int(row.get('Stock') or 0),
+                    'sku': row.get('SKU', ''),
+                    'cft': float(row.get('CFT') or 0),
+                    'material': row.get('Material', ''),
+                    'finish': row.get('Finish', ''),
+                    'specifications': row.get('Specifications', ''),
+                    'main_image': None,
+                    'image_data': None
+                })
+
         else:
-            df = pd.read_excel(io.BytesIO(contents))
+            wb = load_workbook(io.BytesIO(contents), data_only=True)
+            ws = wb.active
+            headers = [cell.value for cell in ws[1]]
+
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                row_data = dict(zip(headers, row))
+                products.append({
+                    'name': row_data.get('Name', ''),
+                    'category_name': row_data.get('Category', ''),
+                    'subcategory_name': row_data.get('Subcategory', ''),
+                    'description': row_data.get('Description', ''),
+                    'price': float(row_data.get('Price') or 0),
+                    'stock_quantity': int(row_data.get('Stock') or 0),
+                    'sku': row_data.get('SKU', ''),
+                    'cft': float(row_data.get('CFT') or 0),
+                    'material': row_data.get('Material', ''),
+                    'finish': row_data.get('Finish', ''),
+                    'specifications': row_data.get('Specifications', ''),
+                    'main_image': None,
+                    'image_data': None
+                })
+
     except Exception as e:
         raise HTTPException(400, f"Parse error: {str(e)}")
-    
-    products = []
-    for _, row in df.iterrows():
-        # Assume same column order as your PHP template
-        product = {
-            'name': str(row.get('Name', '')),
-            'category_name': str(row.get('Category', '')),
-            'subcategory_name': str(row.get('Subcategory', '')),
-            'description': str(row.get('Description', '')),
-            'price': float(row.get('Price', 0)),
-            'stock_quantity': int(row.get('Stock', 0)),
-            'sku': str(row.get('SKU', '')) if pd.notna(row.get('SKU')) else '',
-            'cft': float(row.get('CFT', 0)),
-            'material': str(row.get('Material', '')),
-            'finish': str(row.get('Finish', '')),
-            'specifications': str(row.get('Specifications', '')),
-            'main_image': None,
-            'image_data': None
-        }
-        products.append(product)
-    
+
     return {"products": products}
 
 # -----------------------------
@@ -106,14 +130,25 @@ async def export_excel(products: str = Form(...)):
     except:
         raise HTTPException(400, "Invalid JSON")
 
-    df = pd.DataFrame(data)
+    wb = load_workbook(io.BytesIO(), write_only=True)
+    ws = wb.create_sheet("Products")
+
+    if not data:
+        raise HTTPException(400, "No data to export")
+
+    headers = list(data[0].keys())
+    ws.append(headers)
+
+    for item in data:
+        ws.append([item.get(h, "") for h in headers])
+
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Products')
+    wb.save(output)
     output.seek(0)
+
     return StreamingResponse(
         output,
-        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=products_export.xlsx"}
     )
 
@@ -142,7 +177,7 @@ async def export_pptx(products: str = Form(...)):
 
     subtitle = slide.shapes.add_textbox(Inches(1), Inches(4), Inches(11), Inches(1))
     tf2 = subtitle.text_frame
-    tf2.text = f"Generated on {pd.Timestamp.now().strftime('%B %d, %Y')}"
+    tf2.text = f"Generated on {datetime.now().strftime('%B %d, %Y')}"
 
     # Product slides (2 per slide)
     chunks = [data[i:i+2] for i in range(0, len(data), 2)]
