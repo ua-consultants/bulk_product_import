@@ -15,6 +15,9 @@ import uuid
 import json
 import shutil
 from typing import List, Optional
+import requests
+from PIL import Image
+import base64
 
 app = FastAPI(title="ERP Product Import/Export Service")
 
@@ -126,12 +129,11 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                         "price": 0.0,
                         "stock_quantity": 0,
                         "main_image": img_name,
-                        "image_path": img_path  # For internal use only
+                        "image_path": img_path
                     })
                     image_found = True
-                    break  # One image per slide
+                    break
             if not image_found:
-                # Add placeholder product if no image
                 products.append({
                     "name": f"Product from Slide {i} (no image)",
                     "description": "",
@@ -142,13 +144,9 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                     "main_image": None
                 })
 
-        # Return image_dir so client can request image files if needed (optional)
-        # But for security, we don't expose paths. So we just return product stubs.
-        # Actual image export should be handled separately.
         return {"products": products}
 
     finally:
-        # Clean up temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 # -----------------------------
@@ -170,8 +168,6 @@ async def export_excel(products: str = Form(...)):
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Products")
 
-    # Define headers from first product or standard set
-    sample = data[0]
     headers = [
         'name', 'category_name', 'subcategory_name', 'description',
         'price', 'stock_quantity', 'sku', 'cft', 'material', 'finish', 'specifications'
@@ -205,10 +201,75 @@ async def export_excel(products: str = Form(...)):
     )
 
 # -----------------------------
-# EXPORT: PowerPoint
+# Helper: Download and process image
+# -----------------------------
+def download_image(image_url_or_path, base_url=None):
+    """
+    Download image from URL or base64 data
+    Returns PIL Image object or None
+    """
+    try:
+        # Check if it's base64 data
+        if isinstance(image_url_or_path, str) and image_url_or_path.startswith('data:image'):
+            # Extract base64 data
+            header, encoded = image_url_or_path.split(',', 1)
+            img_data = base64.b64decode(encoded)
+            return Image.open(io.BytesIO(img_data))
+        
+        # Check if it's a base64 string without header
+        if isinstance(image_url_or_path, str) and len(image_url_or_path) > 100 and not image_url_or_path.startswith('http'):
+            try:
+                img_data = base64.b64decode(image_url_or_path)
+                return Image.open(io.BytesIO(img_data))
+            except:
+                pass
+        
+        # Construct full URL if base_url provided
+        if base_url and not image_url_or_path.startswith('http'):
+            image_url = f"{base_url.rstrip('/')}/{image_url_or_path.lstrip('/')}"
+        else:
+            image_url = image_url_or_path
+        
+        # Download from URL
+        response = requests.get(image_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if response.status_code == 200:
+            return Image.open(io.BytesIO(response.content))
+    except Exception as e:
+        print(f"Failed to download image {image_url_or_path}: {e}")
+    
+    return None
+
+def resize_image_for_ppt(img, max_width=3.5, max_height=3.5):
+    """
+    Resize PIL image to fit within PowerPoint dimensions (in inches)
+    Returns width and height in Inches
+    """
+    img_width, img_height = img.size
+    aspect = img_width / img_height
+    
+    # Convert inches to pixels (assume 96 DPI)
+    max_w_px = max_width * 96
+    max_h_px = max_height * 96
+    
+    if img_width > max_w_px or img_height > max_h_px:
+        if aspect > 1:  # Wider than tall
+            new_width = max_w_px
+            new_height = new_width / aspect
+        else:  # Taller than wide
+            new_height = max_h_px
+            new_width = new_height * aspect
+    else:
+        new_width = img_width
+        new_height = img_height
+    
+    # Convert back to inches
+    return Inches(new_width / 96), Inches(new_height / 96)
+
+# -----------------------------
+# EXPORT: PowerPoint with Images
 # -----------------------------
 @app.post("/export/pptx")
-async def export_pptx(products: str = Form(...)):
+async def export_pptx(products: str = Form(...), base_url: str = Form(None)):
     try:
         data = json.loads(products)
     except Exception as e:
@@ -221,12 +282,12 @@ async def export_pptx(products: str = Form(...)):
     prs.slide_width = Inches(13.33)
     prs.slide_height = Inches(7.5)
 
-    # Clear default slide if any
+    # Clear default slides
     if len(prs.slides) > 0:
         prs.slides._sldIdLst = prs.slides._sldIdLst[:0]
 
     # Title slide
-    slide = prs.slides.add_slide(prs.slide_layouts[6])  # Blank layout
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
     left = top = Inches(1)
     width = Inches(11.33)
     height = Inches(2)
@@ -245,35 +306,77 @@ async def export_pptx(products: str = Form(...)):
 
     # Product slides: 2 per slide
     chunks = [data[i:i+2] for i in range(0, len(data), 2)]
+    
     for chunk in chunks:
         slide = prs.slides.add_slide(prs.slide_layouts[6])
+        
         for idx, prod in enumerate(chunk):
-            x = Inches(0.5 + idx * 6.5)
-            y = Inches(1.5)
-
+            x_base = Inches(0.5 + idx * 6.5)
+            y = Inches(0.5)
+            
+            # Try to add product image
+            image_added = False
+            main_image = prod.get('main_image') or prod.get('image_url')
+            
+            if main_image:
+                img = download_image(main_image, base_url)
+                if img:
+                    try:
+                        # Save to temporary file
+                        temp_img = io.BytesIO()
+                        img_format = 'PNG' if img.mode == 'RGBA' else 'JPEG'
+                        img.save(temp_img, format=img_format)
+                        temp_img.seek(0)
+                        
+                        # Calculate size
+                        width, height = resize_image_for_ppt(img, max_width=5.5, max_height=3.5)
+                        
+                        # Center image in its column
+                        x_img = x_base + (Inches(6) - width) / 2
+                        
+                        # Add to slide
+                        slide.shapes.add_picture(temp_img, x_img, y, width=width, height=height)
+                        image_added = True
+                        y += height + Inches(0.2)
+                    except Exception as e:
+                        print(f"Failed to add image: {e}")
+            
+            # If no image added, leave space
+            if not image_added:
+                y += Inches(2.5)
+            
             # Product name
-            name_box = slide.shapes.add_textbox(x, y, Inches(6), Inches(0.5))
+            name_box = slide.shapes.add_textbox(x_base, y, Inches(6), Inches(0.5))
             name_tf = name_box.text_frame
-            name_tf.text = str(prod.get('name', 'Unnamed'))
+            name_tf.text = str(prod.get('name', 'Unnamed Product'))
             name_tf.paragraphs[0].font.bold = True
             name_tf.paragraphs[0].font.size = Pt(16)
-
+            name_tf.word_wrap = True
+            
             # Details
             y += Inches(0.6)
-            details = f"Price: ${float(prod.get('price', 0)):.2f}\n"
+            details = []
+            
+            if prod.get('price'):
+                details.append(f"Price: ${float(prod.get('price', 0)):.2f}")
             if prod.get('sku'):
-                details += f"SKU: {prod['sku']}\n"
+                details.append(f"SKU: {prod['sku']}")
+            if prod.get('stock_quantity') is not None:
+                details.append(f"Stock: {prod['stock_quantity']}")
             if prod.get('cft'):
-                details += f"CFT: {prod['cft']}\n"
+                details.append(f"CFT: {prod['cft']}")
             if prod.get('material'):
-                details += f"Material: {prod['material']}\n"
+                details.append(f"Material: {prod['material']}")
             if prod.get('finish'):
-                details += f"Finish: {prod['finish']}\n"
-
-            details_box = slide.shapes.add_textbox(x, y, Inches(6), Inches(2))
+                details.append(f"Finish: {prod['finish']}")
+            
+            details_text = '\n'.join(details)
+            
+            details_box = slide.shapes.add_textbox(x_base, y, Inches(6), Inches(2))
             details_tf = details_box.text_frame
-            details_tf.text = details
-            details_tf.paragraphs[0].font.size = Pt(12)
+            details_tf.text = details_text
+            details_tf.paragraphs[0].font.size = Pt(11)
+            details_tf.word_wrap = True
 
     output = io.BytesIO()
     prs.save(output)
