@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-python-pptx
 openpyxl
-python-multipart
+python-pptx
+pillow
+requests
