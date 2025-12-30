@@ -22,6 +22,14 @@ import base64
 app = FastAPI(title="ERP Product Import/Export Service")
 
 # -----------------------------
+# HEALTH CHECK (for wake-up)
+# -----------------------------
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "ERP Import/Export", "timestamp": datetime.now().isoformat()}
+
+# -----------------------------
 # IMPORT: Excel/CSV
 # -----------------------------
 @app.post("/import/excel")
