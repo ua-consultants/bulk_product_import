@@ -114,8 +114,6 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
             f.write(contents)
 
         prs = Presentation(tmp_path)
-        image_dir = os.path.join(temp_dir, "extracted_images")
-        os.makedirs(image_dir, exist_ok=True)
         products = []
 
         for i, slide in enumerate(prs.slides, 1):
@@ -123,12 +121,13 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
             for shape in slide.shapes:
                 if hasattr(shape, "image"):
                     img = shape.image
+                    # Read image bytes
+                    img_bytes = img.blob
+                    # Encode as base64
+                    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
                     ext = img.ext or "png"
-                    img_name = f"product_{i}_{uuid.uuid4().hex}.{ext}"
-                    img_path = os.path.join(image_dir, img_name)
-                    with open(img_path, "wb") as f_img:
-                        f_img.write(img.blob)
-                    
+                    img_name = f"slide_{i}.{ext}"
+
                     products.append({
                         "name": f"Product from Slide {i}",
                         "description": "",
@@ -137,10 +136,11 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                         "price": 0.0,
                         "stock_quantity": 0,
                         "main_image": img_name,
-                        "image_path": img_path
+                        "image_data": img_b64  # Send image data directly
                     })
                     image_found = True
                     break
+
             if not image_found:
                 products.append({
                     "name": f"Product from Slide {i} (no image)",
@@ -149,14 +149,16 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                     "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
                     "price": 0.0,
                     "stock_quantity": 0,
-                    "main_image": None
+                    "main_image": None,
+                    "image_data": None
                 })
 
         return {"products": products}
 
     finally:
+        # Safe to delete temp files now—data is already sent
         shutil.rmtree(temp_dir, ignore_errors=True)
-
+        
 # -----------------------------
 # EXPORT: Excel
 # -----------------------------
