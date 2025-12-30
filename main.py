@@ -118,33 +118,44 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
 
         for i, slide in enumerate(prs.slides, 1):
             image_found = False
-            for shape in slide.shapes:
-                if hasattr(shape, "image"):
-                    img = shape.image
-                    # Read image bytes
-                    img_bytes = img.blob
-                    # Encode as base64
-                    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-                    ext = img.ext or "png"
-                    img_name = f"slide_{i}.{ext}"
+            try:
+                for shape in slide.shapes:
+                    if hasattr(shape, "image") and shape.image:
+                        img = shape.image
+                        ext = img.ext or "png"
+                        img_bytes = img.blob
+                        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+                        img_name = f"slide_{i}.{ext}"
 
-                    products.append({
-                        "name": f"Product from Slide {i}",
-                        "description": "",
-                        "category_id": category_id,
-                        "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
-                        "price": 0.0,
-                        "stock_quantity": 0,
-                        "main_image": img_name,
-                        "image_data": img_b64  # Send image data directly
-                    })
-                    image_found = True
-                    break
+                        products.append({
+                            "name": f"Product from Slide {i}",
+                            "description": "",
+                            "category_id": category_id,
+                            "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
+                            "price": 0.0,
+                            "stock_quantity": 0,
+                            "main_image": img_name,
+                            "image_data": img_b64
+                        })
+                        image_found = True
+                        break  # Only first image per slide
+            except Exception as shape_error:
+                print(f"Error processing slide {i}: {repr(shape_error)}")
+                products.append({
+                    "name": f"Product from Slide {i} (error)",
+                    "description": f"Processing error: {str(shape_error)}",
+                    "category_id": category_id,
+                    "subcategory_id": None,
+                    "price": 0.0,
+                    "stock_quantity": 0,
+                    "main_image": None,
+                    "image_data": None
+                })
 
             if not image_found:
                 products.append({
                     "name": f"Product from Slide {i} (no image)",
-                    "description": "",
+                    "description": "No image found on slide",
                     "category_id": category_id,
                     "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
                     "price": 0.0,
@@ -153,10 +164,14 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                     "image_data": None
                 })
 
-        return {"products": products}
+        return {"products": products, "debug": f"Processed {len(prs.slides)} slides"}
+
+    except Exception as e:
+        error_msg = f"PowerPoint processing failed: {repr(e)}"
+        print(error_msg)
+        return {"error": error_msg, "products": []}
 
     finally:
-        # Safe to delete temp files now—data is already sent
         shutil.rmtree(temp_dir, ignore_errors=True)
         
 # -----------------------------
