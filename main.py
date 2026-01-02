@@ -1,6 +1,7 @@
 # main.py — ERP Product Import/Export Service (Render-compatible)
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import Workbook, load_workbook
 import csv
 from datetime import datetime
@@ -20,6 +21,15 @@ from PIL import Image
 import base64
 
 app = FastAPI(title="ERP Product Import/Export Service")
+
+# Enable CORS for all origins (important for browser access)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------------
 # HEALTH CHECK (for wake-up)
@@ -98,7 +108,7 @@ async def import_excel(file: UploadFile = File(...)):
     return {"products": products}
 
 # -----------------------------
-# IMPORT: PowerPoint (images only)
+# IMPORT: PowerPoint (images + text extraction)
 # -----------------------------
 @app.post("/import/pptx")
 async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), subcategory_id: Optional[str] = Form(None)):
@@ -116,64 +126,202 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
         prs = Presentation(tmp_path)
         products = []
 
-        for i, slide in enumerate(prs.slides, 1):
-            image_found = False
-            try:
-                for shape in slide.shapes:
-                    if hasattr(shape, "image") and shape.image:
-                        img = shape.image
-                        ext = img.ext or "png"
-                        img_bytes = img.blob
-                        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-                        img_name = f"slide_{i}.{ext}"
+        for slide_num, slide in enumerate(prs.slides, 1):
+            # Extract all text from slide
+            all_text = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    all_text.append(shape.text.strip())
+            
+            full_text = "\n".join(all_text)
+            
+            # Extract all images from slide
+            images = []
+            for shape in slide.shapes:
+                if hasattr(shape, "image"):
+                    img = shape.image
+                    ext = img.ext or "png"
+                    img_name = f"slide_{slide_num}_img_{len(images) + 1}_{uuid.uuid4().hex[:8]}.{ext}"
+                    img_base64 = base64.b64encode(img.blob).decode('utf-8')
+                    images.append({
+                        'filename': img_name,
+                        'data': img_base64
+                    })
+            
+            # Parse text to extract product info
+            product_data = parse_product_text(full_text)
+            
+            # Determine product name
+            if product_data.get('name'):
+                product_name = product_data['name']
+            elif images:
+                product_name = f"Product from Slide {slide_num}"
+            else:
+                product_name = f"Product {slide_num}"
+            
+            # Build product object
+            product = {
+                "name": product_name,
+                "description": product_data.get('description', ''),
+                "category_id": category_id,
+                "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
+                "price": product_data.get('price', 0.0),
+                "stock_quantity": product_data.get('stock', 0),
+                "sku": product_data.get('sku', ''),
+                "main_image": None,
+                "main_image_data": None,
+                "gallery_images": [],
+                "dimensions": product_data.get('dimensions', ''),
+                "material": product_data.get('material', ''),
+                "specifications": product_data.get('specifications', '')
+            }
+            
+            # Handle images
+            if len(images) > 0:
+                # First image is main image
+                product['main_image'] = images[0]['filename']
+                product['main_image_data'] = images[0]['data']
+                
+                # Rest are gallery images
+                if len(images) > 1:
+                    product['gallery_images'] = images[1:]
+            
+            # Only add product if it has at least a name or an image
+            if product['name'] or images:
+                products.append(product)
 
-                        products.append({
-                            "name": f"Product from Slide {i}",
-                            "description": "",
-                            "category_id": category_id,
-                            "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
-                            "price": 0.0,
-                            "stock_quantity": 0,
-                            "main_image": img_name,
-                            "image_data": img_b64
-                        })
-                        image_found = True
-                        break  # Only first image per slide
-            except Exception as shape_error:
-                print(f"Error processing slide {i}: {repr(shape_error)}")
-                products.append({
-                    "name": f"Product from Slide {i} (error)",
-                    "description": f"Processing error: {str(shape_error)}",
-                    "category_id": category_id,
-                    "subcategory_id": None,
-                    "price": 0.0,
-                    "stock_quantity": 0,
-                    "main_image": None,
-                    "image_data": None
-                })
-
-            if not image_found:
-                products.append({
-                    "name": f"Product from Slide {i} (no image)",
-                    "description": "No image found on slide",
-                    "category_id": category_id,
-                    "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
-                    "price": 0.0,
-                    "stock_quantity": 0,
-                    "main_image": None,
-                    "image_data": None
-                })
-
-        return {"products": products, "debug": f"Processed {len(prs.slides)} slides"}
+        return {"products": products, "total": len(products)}
 
     except Exception as e:
-        error_msg = f"PowerPoint processing failed: {repr(e)}"
-        print(error_msg)
-        return {"error": error_msg, "products": []}
-
+        raise HTTPException(500, f"Failed to process PowerPoint: {str(e)}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        
+
+
+def parse_product_text(text: str) -> dict:
+    """
+    Parse product information from text using keywords
+    """
+    import re
+    
+    data = {
+        'name': '',
+        'description': '',
+        'price': 0.0,
+        'stock': 0,
+        'sku': '',
+        'dimensions': '',
+        'material': '',
+        'specifications': ''
+    }
+    
+    if not text:
+        return data
+    
+    lines = text.split('\n')
+    text_lower = text.lower()
+    
+    # Extract Price
+    price_patterns = [
+        r'(?:price|rate|cost|rs\.?|₹)\s*[:=-]?\s*(?:rs\.?|₹)?\s*([\d,]+(?:\.\d{2})?)',
+        r'(?:rs\.?|₹)\s*([\d,]+(?:\.\d{2})?)',
+    ]
+    for pattern in price_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            price_str = match.group(1).replace(',', '')
+            try:
+                data['price'] = float(price_str)
+                break
+            except:
+                pass
+    
+    # Extract SKU
+    sku_patterns = [
+        r'(?:sku|item\s*code|product\s*code|code)\s*[:=-]?\s*([A-Z0-9-]+)',
+        r'\b([A-Z]{2,}\d{3,})\b',  # Pattern like ABC123
+    ]
+    for pattern in sku_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data['sku'] = match.group(1).strip()
+            break
+    
+    # Extract Dimensions/Size
+    dim_patterns = [
+        r'(?:size|dimension|dimensions|measurements?)\s*[:=-]?\s*(.+?)(?:\n|$)',
+        r'(\d+\s*[xX×]\s*\d+\s*[xX×]?\s*\d*)\s*(?:cm|mm|inch|ft|m)',
+    ]
+    for pattern in dim_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data['dimensions'] = match.group(1).strip()
+            break
+    
+    # Extract Material
+    material_patterns = [
+        r'(?:material|made\s*of)\s*[:=-]?\s*(.+?)(?:\n|$)',
+    ]
+    for pattern in material_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data['material'] = match.group(1).strip()
+            break
+    
+    # Extract Stock/Quantity
+    stock_patterns = [
+        r'(?:stock|quantity|qty|available)\s*[:=-]?\s*(\d+)',
+    ]
+    for pattern in stock_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            try:
+                data['stock'] = int(match.group(1))
+                break
+            except:
+                pass
+    
+    # Extract Description
+    desc_patterns = [
+        r'(?:desc|description)\s*[:=-]?\s*(.+?)(?:\n\n|$)',
+    ]
+    for pattern in desc_patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            data['description'] = match.group(1).strip()
+            break
+    
+    # If no explicit description, use first few lines as description
+    if not data['description'] and len(lines) > 1:
+        # Skip lines that look like labels or have extracted data
+        desc_lines = []
+        for line in lines[:5]:  # First 5 lines
+            line = line.strip()
+            if len(line) > 15 and not re.match(r'^(price|sku|size|material|stock)', line, re.IGNORECASE):
+                desc_lines.append(line)
+        if desc_lines:
+            data['description'] = ' '.join(desc_lines)[:500]  # Limit to 500 chars
+    
+    # Extract Product Name (first line if it's substantial)
+    if lines:
+        first_line = lines[0].strip()
+        # First line is name if it's not a label and has reasonable length
+        if len(first_line) > 3 and len(first_line) < 100:
+            if not re.match(r'^(price|sku|size|material|stock|desc)', first_line, re.IGNORECASE):
+                data['name'] = first_line
+    
+    # Compile specifications from all extracted data
+    specs = []
+    if data['dimensions']:
+        specs.append(f"Dimensions: {data['dimensions']}")
+    if data['material']:
+        specs.append(f"Material: {data['material']}")
+    
+    if specs:
+        data['specifications'] = '; '.join(specs)
+    
+    return data
+
 # -----------------------------
 # EXPORT: Excel
 # -----------------------------
