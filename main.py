@@ -113,12 +113,26 @@ async def import_excel(file: UploadFile = File(...)):
 # Fixed /import/pptx endpoint in main.py
 @app.post("/import/pptx")
 async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), subcategory_id: Optional[str] = Form(None)):
+    debug_info = []
+    
+    debug_info.append(f"Received file: {file.filename}")
+    debug_info.append(f"Content type: {file.content_type}")
+    debug_info.append(f"Category ID: {category_id}")
+    debug_info.append(f"Subcategory ID: {subcategory_id}")
+    
     if not file.filename.endswith('.pptx'):
         raise HTTPException(400, "Only .pptx files allowed")
     
-    contents = await file.read()
-    temp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(temp_dir, "uploaded.pptx")
+    try:
+        contents = await file.read()
+        debug_info.append(f"File size: {len(contents)} bytes")
+        
+        if len(contents) == 0:
+            raise HTTPException(400, "Uploaded file is empty")
+        
+        temp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(temp_dir, "uploaded.pptx")
+        debug_info.append(f"Temp path: {tmp_path}")
     
     try:
         with open(tmp_path, "wb") as f:
@@ -415,7 +429,6 @@ def parse_product_text(text: str) -> dict:
         data['specifications'] = '; '.join(specs)
     
     return data
-
 # -----------------------------
 # EXPORT: Excel
 # -----------------------------
