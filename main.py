@@ -110,6 +110,7 @@ async def import_excel(file: UploadFile = File(...)):
 # -----------------------------
 # IMPORT: PowerPoint (images + text extraction)
 # -----------------------------
+# Fixed /import/pptx endpoint in main.py
 @app.post("/import/pptx")
 async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), subcategory_id: Optional[str] = Form(None)):
     if not file.filename.endswith('.pptx'):
@@ -125,8 +126,11 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
 
         prs = Presentation(tmp_path)
         products = []
+        debug_info = []  # Add debug information
 
         for slide_num, slide in enumerate(prs.slides, 1):
+            debug_info.append(f"Processing slide {slide_num}")
+            
             # Extract all text from slide
             all_text = []
             for shape in slide.shapes:
@@ -134,6 +138,7 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                     all_text.append(shape.text.strip())
             
             full_text = "\n".join(all_text)
+            debug_info.append(f"Slide {slide_num} text length: {len(full_text)}")
             
             # Extract all images from slide
             images = []
@@ -148,21 +153,52 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                         'data': img_base64
                     })
             
+            debug_info.append(f"Slide {slide_num} images found: {len(images)}")
+            
+            # CRITICAL FIX: Only create product if there's at least one image OR meaningful text
+            if len(images) == 0 and len(full_text.strip()) < 10:
+                debug_info.append(f"Slide {slide_num} skipped: no images and minimal text")
+                continue
+            
             # Parse text to extract product info
             product_data = parse_product_text(full_text)
             
-            # Determine product name
-            if product_data.get('name'):
+            # IMPROVED: Better product name logic
+            product_name = None
+            
+            # Priority 1: Use parsed name if it exists and isn't generic
+            if product_data.get('name') and len(product_data['name']) > 3:
                 product_name = product_data['name']
-            elif images:
+            
+            # Priority 2: Use first substantial line of text
+            elif full_text.strip():
+                lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+                for line in lines:
+                    # Skip lines that are likely labels or very short
+                    if len(line) >= 5 and len(line) <= 100:
+                        # Check if it's not a field label
+                        if not re.match(r'^(price|sku|size|material|stock|desc|dimension|rate|cost|qty)', 
+                                      line, re.IGNORECASE):
+                            product_name = line
+                            break
+            
+            # Priority 3: If there's an image but no good name, use generic name
+            if not product_name and images:
                 product_name = f"Product from Slide {slide_num}"
-            else:
+            
+            # Priority 4: If there's text but no image, still create product
+            if not product_name and full_text.strip():
                 product_name = f"Product {slide_num}"
+            
+            # Skip if still no name (shouldn't happen due to earlier check)
+            if not product_name:
+                debug_info.append(f"Slide {slide_num} skipped: could not determine product name")
+                continue
             
             # Build product object
             product = {
                 "name": product_name,
-                "description": product_data.get('description', ''),
+                "description": product_data.get('description', full_text[:500] if full_text else ''),
                 "category_id": category_id,
                 "subcategory_id": int(subcategory_id) if subcategory_id and subcategory_id.isdigit() else None,
                 "price": product_data.get('price', 0.0),
@@ -186,11 +222,15 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
                 if len(images) > 1:
                     product['gallery_images'] = images[1:]
             
-            # Only add product if it has at least a name or an image
-            if product['name'] or images:
-                products.append(product)
+            products.append(product)
+            debug_info.append(f"Slide {slide_num} added as product: {product_name}")
 
-        return {"products": products, "total": len(products)}
+        return {
+            "products": products, 
+            "total": len(products),
+            "slides_processed": len(prs.slides),
+            "debug": debug_info  # Return debug info for troubleshooting
+        }
 
     except Exception as e:
         raise HTTPException(500, f"Failed to process PowerPoint: {str(e)}")
@@ -200,7 +240,7 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
 
 def parse_product_text(text: str) -> dict:
     """
-    Parse product information from text using keywords
+    IMPROVED: Parse product information from text using keywords
     """
     import re
     
@@ -215,31 +255,34 @@ def parse_product_text(text: str) -> dict:
         'specifications': ''
     }
     
-    if not text:
+    if not text or len(text.strip()) < 3:
         return data
     
-    lines = text.split('\n')
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
     text_lower = text.lower()
     
-    # Extract Price
+    # Extract Price - IMPROVED patterns
     price_patterns = [
-        r'(?:price|rate|cost|rs\.?|₹)\s*[:=-]?\s*(?:rs\.?|₹)?\s*([\d,]+(?:\.\d{2})?)',
-        r'(?:rs\.?|₹)\s*([\d,]+(?:\.\d{2})?)',
+        r'(?:price|rate|cost|rs\.?|₹|inr)\s*[:=-]?\s*(?:rs\.?|₹|inr)?\s*([\d,]+(?:\.\d{1,2})?)',
+        r'(?:rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)',
+        r'\$\s*([\d,]+(?:\.\d{1,2})?)',
     ]
     for pattern in price_patterns:
         match = re.search(pattern, text_lower)
         if match:
             price_str = match.group(1).replace(',', '')
             try:
-                data['price'] = float(price_str)
-                break
+                price_val = float(price_str)
+                if price_val > 0:  # Only accept positive prices
+                    data['price'] = price_val
+                    break
             except:
                 pass
     
-    # Extract SKU
+    # Extract SKU - IMPROVED
     sku_patterns = [
-        r'(?:sku|item\s*code|product\s*code|code)\s*[:=-]?\s*([A-Z0-9-]+)',
-        r'\b([A-Z]{2,}\d{3,})\b',  # Pattern like ABC123
+        r'(?:sku|item\s*code|product\s*code|code|item\s*#)\s*[:=-]?\s*([A-Z0-9\-_]+)',
+        r'\b([A-Z]{2,}[\-_]?\d{3,})\b',  # Pattern like ABC-123 or ABC123
     ]
     for pattern in sku_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -247,75 +290,126 @@ def parse_product_text(text: str) -> dict:
             data['sku'] = match.group(1).strip()
             break
     
-    # Extract Dimensions/Size
+    # Extract Dimensions/Size - IMPROVED
     dim_patterns = [
-        r'(?:size|dimension|dimensions|measurements?)\s*[:=-]?\s*(.+?)(?:\n|$)',
-        r'(\d+\s*[xX×]\s*\d+\s*[xX×]?\s*\d*)\s*(?:cm|mm|inch|ft|m)',
+        r'(?:size|dimension|dimensions?|measurements?)\s*[:=-]?\s*([^\n]+?)(?:\n|$)',
+        r'(\d+(?:\.\d+)?\s*[xX×]\s*\d+(?:\.\d+)?(?:\s*[xX×]\s*\d+(?:\.\d+)?)?)\s*(?:cm|mm|inch|ft|m|")',
     ]
     for pattern in dim_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            data['dimensions'] = match.group(1).strip()
-            break
+            dim = match.group(1).strip()
+            if len(dim) < 100:  # Sanity check
+                data['dimensions'] = dim
+                break
     
-    # Extract Material
+    # Extract Material - IMPROVED
+    material_keywords = ['wood', 'metal', 'plastic', 'fabric', 'leather', 'glass', 'steel', 
+                        'aluminum', 'brass', 'copper', 'mdf', 'plywood', 'teak', 'oak']
     material_patterns = [
-        r'(?:material|made\s*of)\s*[:=-]?\s*(.+?)(?:\n|$)',
+        r'(?:material|made\s*of|made\s*from)\s*[:=-]?\s*([^\n]+?)(?:\n|$)',
     ]
     for pattern in material_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            data['material'] = match.group(1).strip()
-            break
+            mat = match.group(1).strip()
+            if len(mat) < 100:
+                data['material'] = mat
+                break
+    
+    # Also check for material keywords in text
+    if not data['material']:
+        for keyword in material_keywords:
+            if keyword in text_lower:
+                data['material'] = keyword.title()
+                break
     
     # Extract Stock/Quantity
     stock_patterns = [
-        r'(?:stock|quantity|qty|available)\s*[:=-]?\s*(\d+)',
+        r'(?:stock|quantity|qty|available|in\s*stock)\s*[:=-]?\s*(\d+)',
     ]
     for pattern in stock_patterns:
         match = re.search(pattern, text_lower)
         if match:
             try:
-                data['stock'] = int(match.group(1))
-                break
+                stock = int(match.group(1))
+                if stock >= 0:
+                    data['stock'] = stock
+                    break
             except:
                 pass
     
-    # Extract Description
+    # Extract Description - IMPROVED
     desc_patterns = [
-        r'(?:desc|description)\s*[:=-]?\s*(.+?)(?:\n\n|$)',
+        r'(?:desc|description)\s*[:=-]?\s*([^\n]+(?:\n[^\n]+)*?)(?:\n\n|$)',
     ]
     for pattern in desc_patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
-            data['description'] = match.group(1).strip()
+            desc = match.group(1).strip()
+            # Limit to 500 chars
+            data['description'] = desc[:500]
             break
     
-    # If no explicit description, use first few lines as description
+    # If no explicit description, build from lines
     if not data['description'] and len(lines) > 1:
-        # Skip lines that look like labels or have extracted data
         desc_lines = []
-        for line in lines[:5]:  # First 5 lines
-            line = line.strip()
-            if len(line) > 15 and not re.match(r'^(price|sku|size|material|stock)', line, re.IGNORECASE):
+        skip_patterns = [
+            r'^(price|sku|size|material|stock|dimension|rate|cost|qty)',
+            r'^\d+\s*[xX×]\s*\d+',  # Skip dimension lines
+            r'^(rs\.?|₹|\$)',  # Skip price lines
+        ]
+        
+        for line in lines[:10]:  # Check first 10 lines
+            # Skip short lines, labels, and extracted data
+            if len(line) < 15:
+                continue
+            
+            skip = False
+            for skip_pattern in skip_patterns:
+                if re.match(skip_pattern, line, re.IGNORECASE):
+                    skip = True
+                    break
+            
+            if not skip:
                 desc_lines.append(line)
+            
+            # Stop if we have enough
+            if len(' '.join(desc_lines)) > 200:
+                break
+        
         if desc_lines:
-            data['description'] = ' '.join(desc_lines)[:500]  # Limit to 500 chars
+            data['description'] = ' '.join(desc_lines)[:500]
     
-    # Extract Product Name (first line if it's substantial)
+    # Extract Product Name - IMPROVED
     if lines:
-        first_line = lines[0].strip()
-        # First line is name if it's not a label and has reasonable length
-        if len(first_line) > 3 and len(first_line) < 100:
-            if not re.match(r'^(price|sku|size|material|stock|desc)', first_line, re.IGNORECASE):
-                data['name'] = first_line
+        # First non-empty, substantial line that's not a label
+        for line in lines[:5]:
+            if len(line) >= 5 and len(line) <= 100:
+                # Check if it's not a label or data field
+                is_label = False
+                label_patterns = [
+                    r'^(price|sku|size|material|stock|dimension|desc|rate|cost|qty)',
+                    r'^\d+\s*[xX×]',
+                    r'^(rs\.?|₹|\$)',
+                ]
+                for label_pattern in label_patterns:
+                    if re.match(label_pattern, line, re.IGNORECASE):
+                        is_label = True
+                        break
+                
+                if not is_label:
+                    data['name'] = line
+                    break
     
-    # Compile specifications from all extracted data
+    # Compile specifications from extracted data
     specs = []
     if data['dimensions']:
         specs.append(f"Dimensions: {data['dimensions']}")
     if data['material']:
         specs.append(f"Material: {data['material']}")
+    if data['stock'] > 0:
+        specs.append(f"Stock: {data['stock']}")
     
     if specs:
         data['specifications'] = '; '.join(specs)
