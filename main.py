@@ -19,6 +19,8 @@ from typing import List, Optional
 import requests
 from PIL import Image
 import base64
+import re
+import traceback
 
 app = FastAPI(title="ERP Product Import/Export Service")
 
@@ -110,7 +112,6 @@ async def import_excel(file: UploadFile = File(...)):
 # -----------------------------
 # IMPORT: PowerPoint (images + text extraction)
 # -----------------------------
-# Fixed /import/pptx endpoint in main.py
 @app.post("/import/pptx")
 async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), subcategory_id: Optional[str] = Form(None)):
     debug_info = []
@@ -133,14 +134,24 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
         temp_dir = tempfile.mkdtemp()
         tmp_path = os.path.join(temp_dir, "uploaded.pptx")
         debug_info.append(f"Temp path: {tmp_path}")
-    
-    try:
+        
         with open(tmp_path, "wb") as f:
             f.write(contents)
+        
+        debug_info.append("File written to temp location")
+        
+        # Verify file was written
+        if not os.path.exists(tmp_path):
+            raise Exception("Failed to write temp file")
+        
+        file_size = os.path.getsize(tmp_path)
+        debug_info.append(f"Temp file size: {file_size} bytes")
 
         prs = Presentation(tmp_path)
+        debug_info.append(f"PowerPoint loaded successfully")
+        debug_info.append(f"Total slides: {len(prs.slides)}")
+        
         products = []
-        debug_info = []  # Add debug information
 
         for slide_num, slide in enumerate(prs.slides, 1):
             debug_info.append(f"Processing slide {slide_num}")
@@ -243,21 +254,32 @@ async def import_pptx(file: UploadFile = File(...), category_id: int = Form(0), 
             "products": products, 
             "total": len(products),
             "slides_processed": len(prs.slides),
-            "debug": debug_info  # Return debug info for troubleshooting
+            "debug": debug_info
         }
 
+    except HTTPException as he:
+        # Re-raise HTTP exceptions
+        raise he
     except Exception as e:
-        raise HTTPException(500, f"Failed to process PowerPoint: {str(e)}")
+        error_detail = {
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc(),
+            "debug": debug_info
+        }
+        raise HTTPException(500, f"Failed to process PowerPoint: {json.dumps(error_detail)}")
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            if 'temp_dir' in locals():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
 
 
 def parse_product_text(text: str) -> dict:
     """
     IMPROVED: Parse product information from text using keywords
     """
-    import re
-    
     data = {
         'name': '',
         'description': '',
@@ -429,6 +451,7 @@ def parse_product_text(text: str) -> dict:
         data['specifications'] = '; '.join(specs)
     
     return data
+
 # -----------------------------
 # EXPORT: Excel
 # -----------------------------
